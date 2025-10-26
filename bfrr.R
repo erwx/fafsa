@@ -1092,3 +1092,391 @@ cat("  - All values ready to insert into LaTeX tables\n\n")
 
 cat("Script completed successfully!\n")
 cat("="  , rep("=", 78), "\n", sep = "")
+
+################################################################################
+# APPENDIX TABLE A3: Save Logistic Model from Tercile Analysis
+################################################################################
+cat("="  , rep("=", 78), "\n", sep = "")
+cat("Saving Appendix Table A3: Logistic Model\n")
+cat("="  , rep("=", 78), "\n", sep = "")
+
+# Check if the logit model exists from the tercile analysis
+if (!is.null(logit_model_app)) {
+  
+  # Extract coefficient table using fixest's coeftable function
+  coef_table <- coeftable(logit_model_app)
+  
+  # Create formatted table matching the paper's structure
+  tableA3 <- data.frame(
+    Variable = rownames(coef_table),
+    Coefficient = round(coef_table[, 1], 3),
+    Std_Error = round(coef_table[, 2], 3),
+    stringsAsFactors = FALSE
+  )
+  
+  # Add significance stars (using z-statistic for logistic regression)
+  z_stat <- abs(tableA3$Coefficient / tableA3$Std_Error)
+  tableA3$Stars <- ifelse(z_stat >= qnorm(0.9995), "***",
+                          ifelse(z_stat >= qnorm(0.995), "**",
+                                 ifelse(z_stat >= qnorm(0.975), "*", "")))
+  
+  # Format for display (matching paper format)
+  tableA3$Formatted_Coef <- paste0(sprintf("%.3f", tableA3$Coefficient), tableA3$Stars)
+  tableA3$Formatted_SE <- paste0("(", sprintf("%.3f", tableA3$Std_Error), ")")
+  
+  # Get number of observations
+  n_obs <- logit_model_app$nobs
+  
+  # Save as list with both raw model and formatted table
+  tableA3_output <- list(
+    model = logit_model_app,
+    formatted_table = tableA3,
+    n_observations = n_obs
+  )
+  
+  saveRDS(tableA3_output, file = file.path(tables_dir, "tableA3_logit_model.Rds"))
+  cat("Appendix Table A3 (logit model) saved successfully to:", 
+      file.path(tables_dir, "tableA3_logit_model.Rds"), "\n")
+  cat("  Number of observations:", format(n_obs, big.mark = ","), "\n")
+  cat("  Number of coefficients:", nrow(tableA3), "\n\n")
+  
+} else {
+  cat("WARNING: Could not save Appendix Table A3 - logit model not available\n")
+  cat("  The tercile analysis may not have completed successfully\n\n")
+}
+
+################################################################################
+# MACHINE LEARNING ROBUSTNESS CHECK: RANDOM FOREST
+################################################################################
+
+cat("="  , rep("=", 78), "\n", sep = "")
+cat("MACHINE LEARNING ROBUSTNESS CHECK: Random Forest Analysis\n")
+cat("="  , rep("=", 78), "\n", sep = "")
+
+# Load required library
+if (!require(ranger)) {
+  install.packages("ranger")
+  library(ranger)
+}
+
+# Same covariates as logistic model
+rf_covars <- c("ind", "fresh", "soph", "uc", "csu", "age",
+               "inc_q1", "inc_q2", "inc_q3", "inc_q4",
+               "fam_1", "fam_2", "fam_3", "fam_4",
+               "black", "hisp", "tmr", "white", "asian",
+               "mhi_2", "mhi_3", "nw_1", "nw_2", "snap_1", "snap_2")
+
+# Function to create terciles using Random Forest
+create_terciles_rf <- function(df, outcome_var, covariates) {
+  cat("  Fitting Random Forest model for", outcome_var, "...\n")
+  
+  # Filter to 2021 for training
+  df_21 <- df %>% filter(year == 2021)
+  
+  # Prepare training data - remove missing values
+  model_data <- df_21 %>%
+    select(all_of(c(outcome_var, covariates, "zip_code"))) %>%
+    drop_na()
+  
+  # Fit Random Forest model
+  cat("  Training Random Forest (this may take a few minutes)...\n")
+  rf_model <- ranger(
+    formula = as.formula(paste(outcome_var, "~", paste(covariates, collapse = " + "))),
+    data = model_data,
+    probability = TRUE,  # For classification with probabilities
+    num.trees = 500,     # Number of trees
+    mtry = floor(sqrt(length(covariates))),  # Number of variables to try at each split
+    importance = "impurity",  # Calculate variable importance
+    seed = 12345,        # For reproducibility
+    num.threads = parallel::detectCores() - 1  # Use multiple cores
+  )
+  
+  cat("  Random Forest trained. Out-of-bag prediction error:", 
+      round(rf_model$prediction.error, 4), "\n")
+  
+  # Function to predict for a given year
+  predict_year_rf <- function(df_year, model) {
+    df_clean <- df_year %>%
+      mutate(row_id = row_number()) %>%
+      select(row_id, all_of(c(outcome_var, covariates))) %>%
+      drop_na()
+    
+    # Predict probabilities (take the probability of outcome = 1)
+    rf_pred <- predict(model, data = df_clean, type = "response")
+    df_clean$prob <- rf_pred$predictions[, 2]  # Probability of class "1"
+    
+    # Merge back
+    df_year <- df_year %>%
+      mutate(row_id = row_number()) %>%
+      left_join(df_clean %>% select(row_id, prob), by = "row_id") %>%
+      select(-row_id)
+    
+    return(df_year)
+  }
+  
+  # Predict for all years
+  cat("  Generating predictions for all years...\n")
+  df_21 <- predict_year_rf(df %>% filter(year == 2021), rf_model)
+  df_22 <- predict_year_rf(df %>% filter(year == 2022), rf_model)
+  df_23 <- predict_year_rf(df %>% filter(year == 2023), rf_model)
+  
+  # Create terciles based on 2021 predictions
+  tercile_breaks <- quantile(df_21$prob, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+  
+  cat("  Random Forest tercile breaks:", paste(round(tercile_breaks, 3), collapse = ", "), "\n")
+  
+  # Assign terciles
+  df_21$tercile <- cut(df_21$prob, breaks = tercile_breaks, 
+                       labels = c("Low", "Middle", "High"), include.lowest = TRUE)
+  df_22$tercile <- cut(df_22$prob, breaks = tercile_breaks, 
+                       labels = c("Low", "Middle", "High"), include.lowest = TRUE)
+  df_23$tercile <- cut(df_23$prob, breaks = tercile_breaks, 
+                       labels = c("Low", "Middle", "High"), include.lowest = TRUE)
+  
+  # Combine
+  combined <- bind_rows(df_21, df_22, df_23)
+  
+  return(list(data = combined, model = rf_model))
+}
+
+################################################################################
+# Run Random Forest for app_next
+################################################################################
+
+cat("\nCreating Random Forest terciles for app_next...\n")
+rf_app_result <- create_terciles_rf(df_reg, "app_next", rf_covars)
+df_app_tercile_rf <- rf_app_result$data
+rf_app_model <- rf_app_result$model
+
+# Variable importance
+cat("\nTop 10 most important variables (app_next):\n")
+var_imp_app <- data.frame(
+  Variable = names(rf_app_model$variable.importance),
+  Importance = rf_app_model$variable.importance
+) %>%
+  arrange(desc(Importance)) %>%
+  head(10)
+print(var_imp_app)
+
+################################################################################
+# Run Random Forest for cal_next
+################################################################################
+
+cat("\nCreating Random Forest terciles for cal_next...\n")
+rf_cal_result <- create_terciles_rf(df_reg, "cal_next", rf_covars)
+df_cal_tercile_rf <- rf_cal_result$data
+rf_cal_model <- rf_cal_result$model
+
+# Variable importance
+cat("\nTop 10 most important variables (cal_next):\n")
+var_imp_cal <- data.frame(
+  Variable = names(rf_cal_model$variable.importance),
+  Importance = rf_cal_model$variable.importance
+) %>%
+  arrange(desc(Importance)) %>%
+  head(10)
+print(var_imp_cal)
+
+################################################################################
+# Compare tercile assignments: Logistic vs Random Forest
+################################################################################
+
+cat("\n", rep("=", 78), "\n", sep = "")
+cat("Comparing Logistic and Random Forest Tercile Assignments\n")
+cat(rep("=", 78), "\n", sep = "")
+
+# Merge terciles from both methods
+compare_app <- df_app_tercile %>%
+  select(year, prob, tercile) %>%
+  rename(prob_logit = prob, tercile_logit = tercile) %>%
+  bind_cols(df_app_tercile_rf %>% select(prob, tercile) %>% 
+              rename(prob_rf = prob, tercile_rf = tercile))
+
+compare_cal <- df_cal_tercile %>%
+  select(year, prob, tercile) %>%
+  rename(prob_logit = prob, tercile_logit = tercile) %>%
+  bind_cols(df_cal_tercile_rf %>% select(prob, tercile) %>% 
+              rename(prob_rf = prob, tercile_rf = tercile))
+
+# Correlation between predicted probabilities
+cat("\nCorrelation between predicted probabilities:\n")
+cat("  app_next:", round(cor(compare_app$prob_logit, compare_app$prob_rf, 
+                             use = "complete.obs"), 3), "\n")
+cat("  cal_next:", round(cor(compare_cal$prob_logit, compare_cal$prob_rf, 
+                             use = "complete.obs"), 3), "\n")
+
+# Agreement in tercile assignment
+cat("\nTercile assignment agreement:\n")
+cat("  app_next:", 
+    round(mean(compare_app$tercile_logit == compare_app$tercile_rf, na.rm = TRUE) * 100, 1), 
+    "%\n")
+cat("  cal_next:", 
+    round(mean(compare_cal$tercile_logit == compare_cal$tercile_rf, na.rm = TRUE) * 100, 1), 
+    "%\n")
+
+# Cross-tabulation
+cat("\napp_next tercile cross-tabulation (Logistic vs RF):\n")
+print(table(Logistic = compare_app$tercile_logit, RandomForest = compare_app$tercile_rf))
+
+cat("\ncal_next tercile cross-tabulation (Logistic vs RF):\n")
+print(table(Logistic = compare_cal$tercile_logit, RandomForest = compare_cal$tercile_rf))
+
+################################################################################
+# TABLE 3 ROBUSTNESS: Random Forest Terciles
+################################################################################
+
+cat("\n", rep("=", 78), "\n", sep = "")
+cat("TABLE 3 ROBUSTNESS CHECK: Using Random Forest Terciles\n")
+cat(rep("=", 78), "\n", sep = "")
+
+# Run regressions for each tercile using RF-based terciles
+cat("Running Random Forest tercile regressions...\n")
+
+# app_next - Low tercile
+app_low_rf <- run_regression_for_group(df_app_tercile_rf %>% filter(tercile == "Low"), 
+                                       "app_next", rf_covars)
+# app_next - Middle tercile
+app_mid_rf <- run_regression_for_group(df_app_tercile_rf %>% filter(tercile == "Middle"), 
+                                       "app_next", rf_covars)
+# app_next - High tercile
+app_high_rf <- run_regression_for_group(df_app_tercile_rf %>% filter(tercile == "High"), 
+                                        "app_next", rf_covars)
+
+# cal_next - Low tercile
+cal_low_rf <- run_regression_for_group(df_cal_tercile_rf %>% filter(tercile == "Low"), 
+                                       "cal_next", rf_covars)
+# cal_next - Middle tercile
+cal_mid_rf <- run_regression_for_group(df_cal_tercile_rf %>% filter(tercile == "Middle"), 
+                                       "cal_next", rf_covars)
+# cal_next - High tercile
+cal_high_rf <- run_regression_for_group(df_cal_tercile_rf %>% filter(tercile == "High"), 
+                                        "cal_next", rf_covars)
+
+# Assemble Table 3 with Random Forest terciles
+cat("Assembling Table 3 with Random Forest terciles...\n")
+
+table3_app_rf <- data.frame(
+  Row = c("Baseline Mean Refile Rate (by Mar 25)",
+          "",
+          "Refiled by Mar 25 in 2024",
+          "SE_2024",
+          "",
+          "Refiled by Mar 25 in 2025",
+          "SE_2025"),
+  Low = c(sprintf("%.3f", app_low_rf$baseline),
+          "",
+          format_coef(app_low_rf$coef_2022, app_low_rf$se_2022),
+          format_se(app_low_rf$se_2022),
+          "",
+          format_coef(app_low_rf$coef_2023, app_low_rf$se_2023),
+          format_se(app_low_rf$se_2023)),
+  Middle = c(sprintf("%.3f", app_mid_rf$baseline),
+             "",
+             format_coef(app_mid_rf$coef_2022, app_mid_rf$se_2022),
+             format_se(app_mid_rf$se_2022),
+             "",
+             format_coef(app_mid_rf$coef_2023, app_mid_rf$se_2023),
+             format_se(app_mid_rf$se_2023)),
+  High = c(sprintf("%.3f", app_high_rf$baseline),
+           "",
+           format_coef(app_high_rf$coef_2022, app_high_rf$se_2022),
+           format_se(app_high_rf$se_2022),
+           "",
+           format_coef(app_high_rf$coef_2023, app_high_rf$se_2023),
+           format_se(app_high_rf$se_2023)),
+  stringsAsFactors = FALSE
+)
+
+table3_cal_rf <- data.frame(
+  Row = c("Baseline Mean Refile Rate (by Cal Grant)",
+          "",
+          "Refiled by March 2 in 2023",
+          "SE_2023",
+          "",
+          "Refiled by June 2 in 2024",
+          "SE_2024"),
+  Low = c(sprintf("%.3f", cal_low_rf$baseline),
+          "",
+          format_coef(cal_low_rf$coef_2022, cal_low_rf$se_2022),
+          format_se(cal_low_rf$se_2022),
+          "",
+          format_coef(cal_low_rf$coef_2023, cal_low_rf$se_2023),
+          format_se(cal_low_rf$se_2023)),
+  Middle = c(sprintf("%.3f", cal_mid_rf$baseline),
+             "",
+             format_coef(cal_mid_rf$coef_2022, cal_mid_rf$se_2022),
+             format_se(cal_mid_rf$se_2022),
+             "",
+             format_coef(cal_mid_rf$coef_2023, cal_mid_rf$se_2023),
+             format_se(cal_mid_rf$se_2023)),
+  High = c(sprintf("%.3f", cal_high_rf$baseline),
+           "",
+           format_coef(cal_high_rf$coef_2022, cal_high_rf$se_2022),
+           format_se(cal_high_rf$se_2022),
+           "",
+           format_coef(cal_high_rf$coef_2023, cal_high_rf$se_2023),
+           format_se(cal_high_rf$se_2023)),
+  stringsAsFactors = FALSE
+)
+
+table3_rf <- list(
+  app_next = table3_app_rf,
+  cal_next = table3_cal_rf
+)
+
+# Save Table 3 with Random Forest terciles
+saveRDS(table3_rf, file = file.path(tables_dir, "table3_random_forest.Rds"))
+cat("Table 3 (Random Forest version) saved successfully to:", 
+    file.path(tables_dir, "table3_random_forest.Rds"), "\n\n")
+
+# Save variable importance
+var_importance <- list(
+  app_next = var_imp_app,
+  cal_next = var_imp_cal
+)
+saveRDS(var_importance, file = file.path(tables_dir, "rf_variable_importance.Rds"))
+
+# Save comparison data
+comparison_results <- list(
+  app_next = compare_app,
+  cal_next = compare_cal,
+  correlation_app = cor(compare_app$prob_logit, compare_app$prob_rf, use = "complete.obs"),
+  correlation_cal = cor(compare_cal$prob_logit, compare_cal$prob_rf, use = "complete.obs"),
+  agreement_app = mean(compare_app$tercile_logit == compare_app$tercile_rf, na.rm = TRUE),
+  agreement_cal = mean(compare_cal$tercile_logit == compare_cal$tercile_rf, na.rm = TRUE)
+)
+saveRDS(comparison_results, file = file.path(tables_dir, "tercile_comparison.Rds"))
+
+cat("\nRandom Forest analysis complete!\n")
+cat("Files saved:\n")
+cat("  - table3_random_forest.Rds (Table 3 using RF terciles)\n")
+cat("  - rf_variable_importance.Rds (Variable importance from RF models)\n")
+cat("  - tercile_comparison.Rds (Comparison of logistic vs RF terciles)\n\n")
+
+################################################################################
+# FINAL SUMMARY INCLUDING ROBUSTNESS CHECK
+################################################################################
+
+cat("="  , rep("=", 78), "\n", sep = "")
+cat("ANALYSIS COMPLETE (INCLUDING RANDOM FOREST ROBUSTNESS CHECK)\n")
+cat("="  , rep("=", 78), "\n", sep = "")
+
+cat("\nAll tables and figures have been generated and saved to:\n")
+cat("  Tables:", tables_dir, "\n")
+cat("  Figures:", figures_dir, "\n\n")
+
+cat("Main Tables created:\n")
+cat("  - summary_tables.Rds (Table 1, Appendix Table A1)\n")
+cat("  - tableA2.Rds (Appendix Table A2)\n")
+cat("  - table2.Rds (Table 2)\n")
+cat("  - table3.Rds (Table 3 - logistic regression terciles)\n")
+cat("  - table3_random_forest.Rds (Table 3 - random forest terciles)\n")
+cat("  - table4.Rds (Table 4)\n")
+cat("  - table5.Rds (Table 5)\n\n")
+
+cat("Robustness Check Files:\n")
+cat("  - rf_variable_importance.Rds\n")
+cat("  - tercile_comparison.Rds\n\n")
+
+cat("Script completed successfully!\n")
+cat("="  , rep("=", 78), "\n", sep = "")
