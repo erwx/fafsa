@@ -32,7 +32,8 @@ tryCatch({
   df <- readRDS(file.path(data_dir, "clean6.Rds"))
   cat("Data loaded successfully.\n")
   cat("Total observations:", nrow(df), "\n")
-  cat("Years:", paste(unique(df$year), collapse = ", "), "\n\n")
+  cat("Years:", paste(unique(df$year), collapse = ", "), "\n")
+  cat("Note: 2024-25 data observed through day 639 of application cycle\n\n")
 }, error = function(e) {
   stop("ERROR: Could not load data file. ", e$message)
 })
@@ -527,8 +528,8 @@ df_reg <- df_reg %>%
 
 cat("Age polynomial terms created.\n")
 cat("  Mean age:", round(mean(df_reg$age, na.rm = TRUE), 2), "\n")
-cat("  Mean age²:", round(mean(df_reg$age_sq, na.rm = TRUE), 2), "\n")
-cat("  Mean age³:", round(mean(df_reg$age_cu, na.rm = TRUE), 2), "\n\n")
+cat("  Mean ageÂ²:", round(mean(df_reg$age_sq, na.rm = TRUE), 2), "\n")
+cat("  Mean ageÂ³:", round(mean(df_reg$age_cu, na.rm = TRUE), 2), "\n\n")
 
 # Force garbage collection
 gc()
@@ -747,9 +748,11 @@ panel_a_cal_uc <- run_regression_for_group(df_reg, "cal_next", c(covars_no_secto
 panel_a_cal_csu <- run_regression_for_group(df_reg, "cal_next", c(covars_no_sector, "fresh", "soph", "jrsr", "dep", "ind"), "csu", 1)
 panel_a_cal_cc <- run_regression_for_group(df_reg, "cal_next", c(covars_no_sector, "fresh", "soph", "jrsr", "dep", "ind"), "cc", 1)
 
-# Panel B: Payment Outcomes (paid) - CSU only
-cat("Running Panel B regressions (Payment - CSU only)...\n")
+# Panel B: Payment Outcomes (paid)
+cat("Running Panel B regressions (Payment by Sector)...\n")
+panel_b_paid_uc <- run_regression_for_group(df_reg, "paid", c(covars_no_sector, "fresh", "soph", "jrsr", "dep", "ind"), "uc", 1)
 panel_b_paid_csu <- run_regression_for_group(df_reg, "paid", c(covars_no_sector, "fresh", "soph", "jrsr", "dep", "ind"), "csu", 1)
+panel_b_paid_cc <- run_regression_for_group(df_reg, "paid", c(covars_no_sector, "fresh", "soph", "jrsr", "dep", "ind"), "cc", 1)
 
 # Panel C: Enrollment Outcomes (enr)
 cat("Running Panel C regressions (Enrollment by Sector)...\n")
@@ -835,6 +838,13 @@ panel_b_paid <- data.frame(
           "",
           "Refiled by Mar 25 in 2025",
           "SE_2025"),
+  UC = c(sprintf("%.3f", panel_b_paid_uc$baseline),
+         "",
+         format_coef(panel_b_paid_uc$coef_2022, panel_b_paid_uc$se_2022),
+         format_se(panel_b_paid_uc$se_2022),
+         "",
+         format_coef(panel_b_paid_uc$coef_2023, panel_b_paid_uc$se_2023),
+         format_se(panel_b_paid_uc$se_2023)),
   CSU = c(sprintf("%.3f", panel_b_paid_csu$baseline),
           "",
           format_coef(panel_b_paid_csu$coef_2022, panel_b_paid_csu$se_2022),
@@ -842,6 +852,13 @@ panel_b_paid <- data.frame(
           "",
           format_coef(panel_b_paid_csu$coef_2023, panel_b_paid_csu$se_2023),
           format_se(panel_b_paid_csu$se_2023)),
+  CCC = c(sprintf("%.3f", panel_b_paid_cc$baseline),
+          "",
+          format_coef(panel_b_paid_cc$coef_2022, panel_b_paid_cc$se_2022),
+          format_se(panel_b_paid_cc$se_2022),
+          "",
+          format_coef(panel_b_paid_cc$coef_2023, panel_b_paid_cc$se_2023),
+          format_se(panel_b_paid_cc$se_2023)),
   stringsAsFactors = FALSE
 )
 
@@ -892,7 +909,7 @@ cat("Table 4 saved successfully to:", file.path(tables_dir, "table4.Rds"), "\n\n
 # Clean up Table 4 objects
 rm(panel_a_app_uc, panel_a_app_csu, panel_a_app_cc)
 rm(panel_a_cal_uc, panel_a_cal_csu, panel_a_cal_cc)
-rm(panel_b_paid_csu)
+rm(panel_b_paid_uc, panel_b_paid_csu, panel_b_paid_cc)
 rm(panel_c_enr_uc, panel_c_enr_csu, panel_c_enr_cc)
 rm(panel_a_app, panel_a_cal, panel_b_paid, panel_c_enr, table4)
 gc()
@@ -1010,7 +1027,7 @@ okabe_ito <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442",
 # Cumulative submission plot function
 plot_cumulative <- function(df, group_var, title = "", filename = NULL) {
   # Filter data
-  df_filtered <- df[df[[group_var]] == 1 & df$day <= 538, ]
+  df_filtered <- df[df[[group_var]] == 1 & df$day <= 639, ]
   
   # Aggregate by year and day
   df_agg <- aggregate(app ~ year + day, data = df_filtered, sum)
@@ -1027,7 +1044,7 @@ plot_cumulative <- function(df, group_var, title = "", filename = NULL) {
   }
   
   plot(NA,
-       xlim = c(0, 550),
+       xlim = c(0, 650),
        ylim = c(0, max(df_agg$cumul_total) * 1.05),
        xlab = "Day",
        ylab = "Cumulative Total",
@@ -1036,7 +1053,7 @@ plot_cumulative <- function(df, group_var, title = "", filename = NULL) {
        yaxt = "n")
   
   # Add axes
-  axis(1, at = seq(0, 550, by = 50))
+  axis(1, at = seq(0, 650, by = 50))
   axis(2, at = pretty(c(0, max(df_agg$cumul_total))),
        labels = format(pretty(c(0, max(df_agg$cumul_total))), big.mark = ","))
   
@@ -1208,7 +1225,7 @@ if (!is.null(logit_model_app)) {
   cat("  Number of observations:", format(n_obs, big.mark = ","), "\n")
   cat("  Number of coefficients:", nrow(tableA3), "\n\n")
   # Add note about polynomial specification
-  cat("  Model includes polynomial age terms (age, ageÂ², ageÂ³)\n")
+  cat("  Model includes polynomial age terms (age, ageÃ‚Â², ageÃ‚Â³)\n")
   cat("  to capture non-linear life-cycle effects on refiling behavior\n\n")
   
 } else {
