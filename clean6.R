@@ -187,7 +187,7 @@ df <- within(df, {
       )
     )
   )
-                          
+
   inc_q1 <- as.integer(qtile_inc == 1)
   inc_q2 <- as.integer(qtile_inc == 2)
   inc_q3 <- as.integer(qtile_inc == 3)
@@ -219,7 +219,7 @@ df$fam_5 <- ifelse(df$fam_size == 5, 1, 0)
 df$fam_6 <- ifelse(df$fam_size == 6, 1, 0) # Family size equals 6 or more
 
 df$age  <- df$year - df$stdt_dob_yr
- 
+
 df$stdt_dob_yr <- NULL
 
 # BEGIN COLLEGE
@@ -241,7 +241,7 @@ college$cc_2021 <- ifelse(college$enroll_cc_fall2021, 1, 0)
 college$cc_2022 <- ifelse(college$enroll_cc_fall2022, 1, 0)
 college$cc_2023 <- ifelse(college$enroll_cc_fall2023, 1, 0)
 college$cc_2024 <- ifelse(college$enroll_cc_fall2024, 1, 0)
-  
+
 college <- college[, !grepl("fall|spring", names(college))]
 
 names(college)[names(college) == "enroll_uc2021"]  <- "uc_2021"
@@ -258,22 +258,22 @@ extract_year_data <- function(df, year) {
   uc_col  <- paste0("uc_", year)
   csu_col <- paste0("csu_", year)
   cc_col  <- paste0("cc_", year)
-  
+
   # subset relevant columns
   temp <- df[, c("fid", uc_col, csu_col, cc_col)]
-  
+
   # filter rows where any of the three columns == 1
   temp <- temp[temp[[uc_col]] == 1 | temp[[csu_col]] == 1 | temp[[cc_col]] == 1, ]
-  
+
   # add unified columns
   temp$year <- year
   temp$uc   <- temp[[uc_col]]
   temp$csu  <- temp[[csu_col]]
   temp$cc   <- temp[[cc_col]]
-  
+
   # keep only final structure
   temp <- temp[, c("fid", "year", "uc", "csu", "cc")]
-  
+
   return(temp)
 }
 
@@ -399,7 +399,6 @@ rm(acs)
 df <- df[!is.na(df$in_acs), ] # drop obs with no acs match (~.75%)
 
 # BEGIN PAY
-#pay <- readRDS("data/pay.Rds")
 tryCatch({
   pay <- read_dta(file.path(data_dir, "better6D.dta"))
   cat("Data loaded successfully.\n")
@@ -410,26 +409,17 @@ tryCatch({
 
 pay <- pay[pay$year > 2020, ]
 
-########### NEED TO PREPARE PAY FILE HERE
 pay <- pay[, -grep("^payf[5-8]$", names(pay))]
+pay <- pay[, -grep("^pay[5-8]$", names(pay))]
 
 df <- merge(df, pay, by = c("fid", "year"), all.x = TRUE)
 
-rm(pay)
+df$paid <- as.integer(rowSums(df[, grep("^pay", names(df))], na.rm = TRUE) > 0)
 
-# df$paid <- as.integer(
-#   rowSums(df[, grep("^payf[2-4]$", names(df))], na.rm = TRUE) > 0)
-
-df$paid <- ifelse(df$payf4 > 0, 1, 0)
-df$paid <- ifelse(is.na(df$paid), 0, df$paid)
-
-# df$paid_cc  <- ifelse(!is.na(df$payf2), 1, 0)
-# df$paid_uc  <- ifelse(!is.na(df$payf3), 1, 0)
-# df$paid_csu <- ifelse(!is.na(df$payf4), 1, 0)
-
-df$payf2 <- NULL
-df$payf3 <- NULL
-df$payf4 <- NULL
+df$paid_cc  <- ifelse(!is.na(df$payf2) | !is.na(df$pay2), 1, 0)
+df$paid_uc  <- ifelse(!is.na(df$payf3) | !is.na(df$pay3), 1, 0)
+df$paid_csu <- ifelse(!is.na(df$payf4) | !is.na(df$pay4), 1, 0)
+# END PAYMENT STUFF
 
 df$cal <- as.integer(
   (df$day <= 154 & df$year < 2024) | (df$day <= 215 & df$year == 2024)
