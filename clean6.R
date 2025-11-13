@@ -393,8 +393,6 @@ df <- merge(df, acs, by = "num_zip", all.x = TRUE)
 
 rm(acs)
 
-# OCT 30 NO MORE DAY RESTRICTION
-#df <- df[df$day <= 538, ]
 
 df <- df[!is.na(df$in_acs), ] # drop obs with no acs match (~.75%)
 
@@ -409,17 +407,17 @@ tryCatch({
 
 pay <- pay[pay$year > 2020, ]
 
-pay <- pay[, -grep("^payf[5-8]$", names(pay))]
+pay <- pay[, -grep("^payf[2-8]$", names(pay))]
 pay <- pay[, -grep("^pay[5-8]$", names(pay))]
 
 df <- merge(df, pay, by = c("fid", "year"), all.x = TRUE)
 
 df$paid <- as.integer(rowSums(df[, grep("^pay", names(df))], na.rm = TRUE) > 0)
 
-df$paid_cc  <- ifelse(!is.na(df$payf2) | !is.na(df$pay2), 1, 0)
-df$paid_uc  <- ifelse(!is.na(df$payf3) | !is.na(df$pay3), 1, 0)
-df$paid_csu <- ifelse(!is.na(df$payf4) | !is.na(df$pay4), 1, 0)
-# END PAYMENT STUFF
+df$paid_cc  <- ifelse(!is.na(df$pay2), 1, 0)
+df$paid_uc  <- ifelse(!is.na(df$pay3), 1, 0)
+df$paid_csu <- ifelse(!is.na(df$pay4), 1, 0)
+# END PAY
 
 df$cal <- as.integer(
   (df$day <= 154 & df$year < 2024) | (df$day <= 215 & df$year == 2024)
