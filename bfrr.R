@@ -1046,6 +1046,7 @@ rm(panel_b_enr_dep, panel_b_enr_ind)
 rm(panel_a_enr, panel_b_enr)
 gc()
 
+
 # PART 4: FIGURES
 # Define Okabe-Ito color palette
 okabe_ito <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", 

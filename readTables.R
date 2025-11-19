@@ -1,0 +1,5 @@
+t1 <- readRDS("tables/table1.Rds")
+t2 <- readRDS("tables/table2.Rds")
+#t3 <- readRDS("tables/table3.Rds")
+t4 <- readRDS("tables/table4.Rds")
+t5 <- readRDS("tables/table5.Rds")

@@ -1,0 +1,537 @@
+---
+title: "FAFSA Refiling: Comparing Random Forest and Logistic Regression"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    code-fold: true
+    theme: minty
+execute:
+  warning: false
+  message: false
+---
+
+This document compares two approaches for predicting FAFSA refiling behavior: Logistic Regression and Random Forest.
+Both methods create terciles based on predicted refiling probabilities, then estimate heterogeneous treatment effects of the 2024 FAFSA simplification.
+
+## Understanding the Timeline
+
+- **year == 2021**: Students who filed FAFSA for AY 2021-22
+- **app_next == 1 && year == 2021**: Student refiled in 2022 for AY 2022-23 (the "next" year)
+- **Baseline period**: AY 2022-23
+- **Treatment period**: AY 2024-25 (refiling done in year == 2023, the "Better FAFSA")
+
+**Why train on 2021?** When year == 2021, the outcome `app_next` tells us whether they refiled in 2022 (for AY 2022-23). This is our baseline period before any policy changes.
+
+```{r setup}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(fixest)
+library(ranger)
+library(knitr)
+library(kableExtra)
+
+options(scipen = 999)
+set.seed(42)
+
+project_dir <- "/home/erik/Repos/fafsa"
+data_dir <- file.path(project_dir, "data")
+tables_dir <- file.path(project_dir, "tables")
+
+dir.create(tables_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+# Data Preparation
+
+```{r load-data}
+df <- readRDS(file.path(data_dir, "clean6.Rds"))
+
+df_reg <- df %>% 
+  filter(year != 2024) %>%
+  mutate(
+    year_factor = as.factor(year),
+    age_sq = age^2, 
+    age_cu = age^3
+  )
+
+covariates <- c(
+  "ind", "fresh", "soph", "uc", "csu", "age", "age_sq", "age_cu",
+  "inc_q1", "inc_q2", "inc_q3", "inc_q4", "fam_1", "fam_2", "fam_3", 
+  "fam_4", "black", "hisp", "tmr", "white", "asian", "mhi_2", "mhi_3", 
+  "nw_1", "nw_2", "snap_1", "snap_2"
+)
+```
+
+```{r sample-sizes}
+df_reg %>%
+  group_by(year) %>%
+  summarise(N = n(), .groups = "drop") %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+---
+
+# Step 1: Create Common Analysis Sample
+
+```{r common-sample}
+# Create common sample - drop NAs once for both models
+df_analysis <- df_reg %>%
+  select(all_of(c("year", "year_factor", "zip_code", "app_next", covariates))) %>%
+  drop_na() %>%
+  mutate(row_id = row_number())  # Unique identifier for each observation
+
+df_analysis %>%
+  count(year) %>%
+  kable(format.args = list(big.mark = ",")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+# Split into training (2021) and full sample
+df_train <- df_analysis %>% filter(year == 2021)
+```
+
+---
+
+# Part 1: Logistic Regression Approach
+
+## 1.1 Train Logistic Model
+
+```{r logit-train}
+fml_logit <- as.formula(paste("app_next ~", paste(covariates, collapse = " + ")))
+logit_model <- feglm(fml_logit, data = df_train, family = binomial(link = "logit"))
+```
+
+## 1.2 Generate Predictions
+
+```{r logit-predict}
+df_analysis$prob_logit <- predict(logit_model, newdata = df_analysis, type = "response")
+```
+
+## 1.3 Create Terciles
+
+```{r logit-terciles}
+tercile_breaks_logit <- df_analysis %>%
+  filter(year == 2021) %>%
+  pull(prob_logit) %>%
+  quantile(probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+
+cat("Tercile breaks (logistic, based on 2021):\n")
+print(round(tercile_breaks_logit, 4))
+
+df_analysis <- df_analysis %>%
+  mutate(
+    tercile_logit = cut(
+      prob_logit,
+      breaks = tercile_breaks_logit,
+      labels = c("Low", "Middle", "High"),
+      include.lowest = TRUE
+    )
+  )
+```
+
+## 1.4 Tercile Characteristics
+
+```{r logit-tercile-summary}
+df_analysis %>%
+  filter(!is.na(tercile_logit)) %>%
+  group_by(tercile_logit, year) %>%
+  summarise(
+    N = n(),
+    Mean_Prob = mean(prob_logit, na.rm = TRUE),
+    Actual_Refile_Rate = mean(app_next, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  kable(digits = 3, format.args = list(big.mark = ","),
+        col.names = c("Tercile", "Year", "N", "Mean Predicted Prob", "Actual Refile Rate")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+---
+
+# Part 2: Random Forest Approach
+
+## 2.1 Train Random Forest
+
+```{r rf-train}
+# Prepare training data with factor outcome for classification
+df_train_rf <- df_train %>%
+  mutate(outcome_factor = as.factor(app_next))
+
+rf_formula <- as.formula(paste("outcome_factor ~", paste(covariates, collapse = " + ")))
+
+system.time({
+  rf_model <- ranger(
+    rf_formula,
+    data = df_train_rf,
+    num.trees = 150,
+    sample.fraction = 0.5,
+    mtry = floor(sqrt(length(covariates))),
+    importance = "impurity",
+    probability = TRUE,
+    num.threads = 4,
+    seed = 42
+  )
+})
+```
+
+## 2.2 Generate Predictions
+
+```{r rf-predict}
+# Prepare CLEAN data for RF prediction - must have same structure as training data
+df_rf_predict <- df_analysis %>%
+  select(all_of(c("row_id", covariates, "app_next"))) %>%
+  mutate(outcome_factor = as.factor(app_next))
+
+# 1. Generate standard out-of-sample predictions (OOS) for all years
+predictions_oos <- predict(rf_model, data = df_rf_predict, type = "response")
+
+# 2. Extract OOB predictions for the training data (year 2021)
+# OOB predictions are stored in rf_model$predictions in the order of the training data df_train_rf
+df_train_oob <- df_train_rf %>% 
+  mutate(prob_rf_oob = rf_model$predictions[, "1"]) %>%
+  select(row_id, prob_rf_oob)
+
+# 3. Combine OOB (for year 2021) and OOS (for years 2022/2023)
+df_analysis <- df_analysis %>%
+  mutate(prob_rf_oos = predictions_oos$predictions[, "1"]) %>%
+  left_join(df_train_oob, by = "row_id") %>%
+  mutate(
+    # Use OOB prediction for the training year (2021), standard OOS prediction otherwise
+    prob_rf = ifelse(year == 2021, prob_rf_oob, prob_rf_oos)
+  ) %>%
+  select(-prob_rf_oos, -prob_rf_oob) # Clean up intermediate columns
+
+# Verify predictions are different
+pred_diff <- sum(abs(df_analysis$prob_logit - df_analysis$prob_rf) > 0.001, na.rm = TRUE)
+```
+
+## 2.3 Create Terciles
+
+```{r rf-terciles}
+# Use OOB for 2021 to set the breaks
+tercile_breaks_rf <- df_analysis %>%
+  filter(year == 2021) %>%
+  pull(prob_rf) %>%
+  quantile(probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+
+print(round(tercile_breaks_rf, 4))
+
+df_analysis <- df_analysis %>%
+  mutate(
+    tercile_rf = cut(
+      prob_rf,
+      breaks = tercile_breaks_rf,
+      labels = c("Low", "Middle", "High"),
+      include.lowest = TRUE
+    )
+  )
+```
+
+## 2.4 Tercile Characteristics
+
+```{r rf-tercile-summary}
+df_analysis %>%
+  filter(!is.na(tercile_rf)) %>%
+  group_by(tercile_rf, year) %>%
+  summarise(
+    N = n(),
+    Mean_Prob = mean(prob_rf, na.rm = TRUE),
+    Actual_Refile_Rate = mean(app_next, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  kable(digits = 3, format.args = list(big.mark = ","),
+        col.names = c("Tercile", "Year", "N", "Mean Predicted Prob", "Actual Refile Rate")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+---
+
+# Part 3: Comparing Predictions
+
+## 3.1 Correlation Between Predictions
+
+```{r compare-predictions}
+cor_overall <- cor(df_analysis$prob_logit, df_analysis$prob_rf, use = "complete.obs")
+
+cor_by_year <- df_analysis %>%
+  group_by(year) %>%
+  summarise(Correlation = cor(prob_logit, prob_rf, use = "complete.obs"))
+
+print(cor_by_year)
+```
+
+## 3.2 Prediction Scatterplots
+
+```{r prediction-scatter, fig.width=10, fig.height=6}
+df_analysis %>%
+  sample_n(min(10000, nrow(df_analysis))) %>%
+  ggplot(aes(x = prob_logit, y = prob_rf)) +
+  geom_point(alpha = 0.1) +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  facet_wrap(~year) +
+  labs(
+    title = "Predicted Probabilities: Logistic vs Random Forest",
+    subtitle = "Red = perfect agreement, Blue = actual relationship",
+    x = "Logistic Predicted Probability",
+    y = "Random Forest Predicted Probability"
+  ) +
+  theme_minimal() +
+  coord_fixed()
+```
+
+---
+
+# Part 4: Treatment Effect Estimation
+
+## 4.1 Logistic Terciles: Regression Results
+
+**The model**: Within each tercile:
+
+$$Y_{it} = \beta_0 + \beta_{2022} \cdot (\text{year}=2022) + \beta_{2023} \cdot (\text{year}=2023) + \mathbf{X}_{it} + \alpha_{\text{zip}} + \varepsilon_{it}$$
+
+```{r logit-regressions}
+results_logit <- list()
+
+for (tercile_name in c("Low", "Middle", "High")) {
+  cat("\n--- Logistic Tercile:", tercile_name, "---\n")
+  
+  df_tercile <- df_analysis %>% filter(tercile_logit == tercile_name)
+  
+  baseline_lm <- lm(app_next ~ year_factor, data = df_tercile)
+  baseline_mean <- coef(baseline_lm)[1]
+  
+  fe_formula <- as.formula(paste(
+    "app_next ~",
+    paste(c("year_factor", covariates), collapse = " + "),
+    "| zip_code"
+  ))
+  
+  model <- feols(fe_formula, data = df_tercile, cluster = "zip_code")
+  
+  coef_tbl <- coeftable(model)
+  year_rows <- grep("year_factor", rownames(coef_tbl))
+  year_coefs <- coef_tbl[year_rows, , drop = FALSE]
+  
+  coef_2022 <- year_coefs[1, 1]
+  se_2022 <- year_coefs[1, 2]
+  t_2022 <- abs(coef_2022 / se_2022)
+  stars_2022 <- ifelse(t_2022 >= 2.576, "***",
+                       ifelse(t_2022 >= 1.96, "**",
+                              ifelse(t_2022 >= 1.645, "*", "")))
+  
+  coef_2023 <- year_coefs[2, 1]
+  se_2023 <- year_coefs[2, 2]
+  t_2023 <- abs(coef_2023 / se_2023)
+  stars_2023 <- ifelse(t_2023 >= 2.576, "***",
+                       ifelse(t_2023 >= 1.96, "**",
+                              ifelse(t_2023 >= 1.645, "*", "")))
+  
+  results_logit[[tercile_name]] <- list(
+    baseline = baseline_mean,
+    coef_2022 = coef_2022, se_2022 = se_2022, stars_2022 = stars_2022,
+    coef_2023 = coef_2023, se_2023 = se_2023, stars_2023 = stars_2023,
+    model = model
+  )
+  
+  cat("Baseline (2022-23):", round(baseline_mean, 3), "\n")
+  cat("Change 2023-24:", sprintf("%.3f%s (SE=%.3f)", coef_2022, stars_2022, se_2022), "\n")
+  cat("Change 2024-25:", sprintf("%.3f%s (SE=%.3f)", coef_2023, stars_2023, se_2023), "\n")
+}
+```
+
+### Logistic Results Table
+
+```{r logit-table}
+table_logit <- data.frame(
+  Row = c(
+    "Baseline (2022-23)", "",
+    "Refiled 2023-24", "", "",
+    "Refiled 2024-25", ""
+  ),
+  Low = c(
+    sprintf("%.3f", results_logit[["Low"]]$baseline), "",
+    sprintf("%.3f%s", results_logit[["Low"]]$coef_2022, results_logit[["Low"]]$stars_2022),
+    sprintf("(%.3f)", results_logit[["Low"]]$se_2022), "",
+    sprintf("%.3f%s", results_logit[["Low"]]$coef_2023, results_logit[["Low"]]$stars_2023),
+    sprintf("(%.3f)", results_logit[["Low"]]$se_2023)
+  ),
+  Middle = c(
+    sprintf("%.3f", results_logit[["Middle"]]$baseline), "",
+    sprintf("%.3f%s", results_logit[["Middle"]]$coef_2022, results_logit[["Middle"]]$stars_2022),
+    sprintf("(%.3f)", results_logit[["Middle"]]$se_2022), "",
+    sprintf("%.3f%s", results_logit[["Middle"]]$coef_2023, results_logit[["Middle"]]$stars_2023),
+    sprintf("(%.3f)", results_logit[["Middle"]]$se_2023)
+  ),
+  High = c(
+    sprintf("%.3f", results_logit[["High"]]$baseline), "",
+    sprintf("%.3f%s", results_logit[["High"]]$coef_2022, results_logit[["High"]]$stars_2022),
+    sprintf("(%.3f)", results_logit[["High"]]$se_2022), "",
+    sprintf("%.3f%s", results_logit[["High"]]$coef_2023, results_logit[["High"]]$stars_2023),
+    sprintf("(%.3f)", results_logit[["High"]]$se_2023)
+  )
+)
+
+kable(table_logit, align = c("l", "c", "c", "c"),
+      caption = "Treatment Effects by Tercile: Logistic Regression") %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  add_header_above(c(" " = 1, "Predicted Refiling Tercile (Logistic)" = 3)) %>%
+  row_spec(c(2, 4), background = "#f0f0f0")
+```
+
+## 4.2 Random Forest Terciles: Regression Results
+
+```{r rf-regressions}
+results_rf <- list()
+
+for (tercile_name in c("Low", "Middle", "High")) {
+  cat("\n--- RF Tercile:", tercile_name, "---\n")
+  
+  df_tercile <- df_analysis %>% filter(tercile_rf == tercile_name)
+  
+  baseline_lm <- lm(app_next ~ year_factor, data = df_tercile)
+  baseline_mean <- coef(baseline_lm)[1]
+  
+  fe_formula <- as.formula(paste(
+    "app_next ~",
+    paste(c("year_factor", covariates), collapse = " + "),
+    "| zip_code"
+  ))
+  
+  model <- feols(fe_formula, data = df_tercile, cluster = "zip_code")
+  
+  coef_tbl <- coeftable(model)
+  year_rows <- grep("year_factor", rownames(coef_tbl))
+  year_coefs <- coef_tbl[year_rows, , drop = FALSE]
+  
+  coef_2022 <- year_coefs[1, 1]
+  se_2022 <- year_coefs[1, 2]
+  t_2022 <- abs(coef_2022 / se_2022)
+  stars_2022 <- ifelse(t_2022 >= 2.576, "***",
+                       ifelse(t_2022 >= 1.96, "**",
+                              ifelse(t_2022 >= 1.645, "*", "")))
+  
+  coef_2023 <- year_coefs[2, 1]
+  se_2023 <- year_coefs[2, 2]
+  t_2023 <- abs(coef_2023 / se_2023)
+  stars_2023 <- ifelse(t_2023 >= 2.576, "***",
+                       ifelse(t_2023 >= 1.96, "**",
+                              ifelse(t_2023 >= 1.645, "*", "")))
+  
+  results_rf[[tercile_name]] <- list(
+    baseline = baseline_mean,
+    coef_2022 = coef_2022, se_2022 = se_2022, stars_2022 = stars_2022,
+    coef_2023 = coef_2023, se_2023 = se_2023, stars_2023 = stars_2023,
+    model = model
+  )
+  
+  cat("Baseline (2022-23):", round(baseline_mean, 3), "\n")
+  cat("Change 2023-24:", sprintf("%.3f%s (SE=%.3f)", coef_2022, stars_2022, se_2022), "\n")
+  cat("Change 2024-25:", sprintf("%.3f%s (SE=%.3f)", coef_2023, stars_2023, se_2023), "\n")
+}
+```
+
+### Random Forest Results Table
+
+```{r rf-table}
+table_rf <- data.frame(
+  Row = c(
+    "Baseline (2022-23)", "",
+    "Refiled 2023-24", "", "",
+    "Refiled 2024-25", ""
+  ),
+  Low = c(
+    sprintf("%.3f", results_rf[["Low"]]$baseline), "",
+    sprintf("%.3f%s", results_rf[["Low"]]$coef_2022, results_rf[["Low"]]$stars_2022),
+    sprintf("(%.3f)", results_rf[["Low"]]$se_2022), "",
+    sprintf("%.3f%s", results_rf[["Low"]]$coef_2023, results_rf[["Low"]]$stars_2023),
+    sprintf("(%.3f)", results_rf[["Low"]]$se_2023)
+  ),
+  Middle = c(
+    sprintf("%.3f", results_rf[["Middle"]]$baseline), "",
+    sprintf("%.3f%s", results_rf[["Middle"]]$coef_2022, results_rf[["Middle"]]$stars_2022),
+    sprintf("(%.3f)", results_rf[["Middle"]]$se_2022), "",
+    sprintf("%.3f%s", results_rf[["Middle"]]$coef_2023, results_rf[["Middle"]]$stars_2023),
+    sprintf("(%.3f)", results_rf[["Middle"]]$se_2023)
+  ),
+  High = c(
+    sprintf("%.3f", results_rf[["High"]]$baseline), "",
+    sprintf("%.3f%s", results_rf[["High"]]$coef_2022, results_rf[["High"]]$stars_2022),
+    sprintf("(%.3f)", results_rf[["High"]]$se_2022), "",
+    sprintf("%.3f%s", results_rf[["High"]]$coef_2023, results_rf[["High"]]$stars_2023),
+    sprintf("(%.3f)", results_rf[["High"]]$se_2023)
+  )
+)
+
+kable(table_rf, align = c("l", "c", "c", "c"),
+      caption = "Treatment Effects by Tercile: Random Forest") %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  add_header_above(c(" " = 1, "Predicted Refiling Tercile (Random Forest)" = 3)) %>%
+  row_spec(c(2, 4), background = "#f0f0f0")
+```
+
+---
+
+# Part 5: Side-by-Side Comparison
+
+## 5.1 Visual Comparison
+
+```{r effect-comparison}
+comparison_df <- data.frame(
+  Tercile = rep(c("Low", "Middle", "High"), 2),
+  Method = rep(c("Logistic", "Random Forest"), each = 3),
+  Baseline = c(
+    results_logit$Low$baseline, results_logit$Middle$baseline, results_logit$High$baseline,
+    results_rf$Low$baseline, results_rf$Middle$baseline, results_rf$High$baseline
+  ),
+  Effect_2023 = c(
+    results_logit$Low$coef_2022, results_logit$Middle$coef_2022, results_logit$High$coef_2022,
+    results_rf$Low$coef_2022, results_rf$Middle$coef_2022, results_rf$High$coef_2022
+  ),
+  SE_2023 = c(
+    results_logit$Low$se_2022, results_logit$Middle$se_2022, results_logit$High$se_2022,
+    results_rf$Low$se_2022, results_rf$Middle$se_2022, results_rf$High$se_2022
+  ),
+  Effect_2024 = c(
+    results_logit$Low$coef_2023, results_logit$Middle$coef_2023, results_logit$High$coef_2023,
+    results_rf$Low$coef_2023, results_rf$Middle$coef_2023, results_rf$High$coef_2023
+  ),
+  SE_2024 = c(
+    results_logit$Low$se_2023, results_logit$Middle$se_2023, results_logit$High$se_2023,
+    results_rf$Low$se_2023, results_rf$Middle$se_2023, results_rf$High$se_2023
+  )
+)
+```
+
+```{r effect-plot, fig.width=12, fig.height=6}
+comparison_df %>%
+  select(Tercile, Method, Effect_2023, SE_2023, Effect_2024, SE_2024) %>%
+  pivot_longer(
+    cols = c(Effect_2023, Effect_2024),
+    names_to = "Period",
+    values_to = "Effect"
+  ) %>%
+  mutate(
+    SE = ifelse(Period == "Effect_2023", SE_2023, SE_2024),
+    Period = recode(Period, Effect_2023 = "2023-24", Effect_2024 = "2024-25"),
+    Lower = Effect - 1.96 * SE,
+    Upper = Effect + 1.96 * SE
+  ) %>%
+  ggplot(aes(x = Tercile, y = Effect, color = Method, group = Method)) +
+  geom_point(position = position_dodge(width = 0.3), size = 3) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), 
+                position = position_dodge(width = 0.3), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  facet_wrap(~Period) +
+  labs(
+    title = "Treatment Effects: Logistic vs Random Forest",
+    subtitle = "Error bars = 95% confidence intervals",
+    y = "Change in Refiling Rate (pp)",
+    x = "Predicted Refiling Tercile"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+---
